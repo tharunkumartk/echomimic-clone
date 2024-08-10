@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
-'''
+"""
 @Project ：EchoMimic
 @File    ：audio2vid.py
 @Author  ：juzhen.czy
 @Date    ：2024/3/4 17:43 
-'''
+"""
 import argparse
 import os
 
@@ -31,26 +31,31 @@ from src.models.face_locator import FaceLocator
 from moviepy.editor import VideoFileClip, AudioFileClip
 from facenet_pytorch import MTCNN
 
-ffmpeg_path = os.getenv('FFMPEG_PATH')
-if ffmpeg_path is None and platform.system() in ['Linux', 'Darwin']:
+ffmpeg_path = os.getenv("FFMPEG_PATH")
+if ffmpeg_path is None and platform.system() in ["Linux", "Darwin"]:
     try:
-        result = subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True)
+        result = subprocess.run(["which", "ffmpeg"], capture_output=True, text=True)
         if result.returncode == 0:
             ffmpeg_path = result.stdout.strip()
             print(f"FFmpeg is installed at: {ffmpeg_path}")
         else:
-            print("FFmpeg is not installed. Please download ffmpeg-static and export to FFMPEG_PATH.")
+            print(
+                "FFmpeg is not installed. Please download ffmpeg-static and export to FFMPEG_PATH."
+            )
             print("For example: export FFMPEG_PATH=/musetalk/ffmpeg-4.4-amd64-static")
     except Exception as e:
         pass
 
-if ffmpeg_path is not None and ffmpeg_path not in os.getenv('PATH'):
+if ffmpeg_path is not None and ffmpeg_path not in os.getenv("PATH"):
     print("Adding FFMPEG_PATH to PATH")
     os.environ["PATH"] = f"{ffmpeg_path}:{os.environ['PATH']}"
 
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="./configs/prompts/animation.yaml")
+    parser.add_argument(
+        "--config", type=str, default="./configs/prompts/animation.yaml"
+    )
     parser.add_argument("-W", type=int, default=512)
     parser.add_argument("-H", type=int, default=512)
     parser.add_argument("-L", type=int, default=1200)
@@ -71,6 +76,7 @@ def parse_args():
 
     return args
 
+
 def select_face(det_bboxes, probs):
     ## max face from faces that the prob is above 0.8
     ## box: xyxy
@@ -83,13 +89,34 @@ def select_face(det_bboxes, probs):
     if len(filtered_bboxes) == 0:
         return None
 
-    sorted_bboxes = sorted(filtered_bboxes, key=lambda x:(x[3]-x[1]) * (x[2] - x[0]), reverse=True)
+    sorted_bboxes = sorted(
+        filtered_bboxes, key=lambda x: (x[3] - x[1]) * (x[2] - x[0]), reverse=True
+    )
     return sorted_bboxes[0]
 
 
+def get_default_args():
+    args = {
+        "config": "./configs/prompts/animation.yaml",
+        "W": 512,
+        "H": 512,
+        "L": 1200,
+        "seed": 420,
+        "facemusk_dilation_ratio": 0.1,
+        "facecrop_dilation_ratio": 0.5,
+        "context_frames": 12,
+        "context_overlap": 3,
+        "cfg": 2.5,
+        "steps": 30,
+        "sample_rate": 16000,
+        "fps": 24,
+        "device": "cuda",
+    }
+    return args
+
 
 def main():
-    args = parse_args()
+    args = get_default_args()
 
     config = OmegaConf.load(args.config)
     if config.weight_dtype == "fp16":
@@ -103,7 +130,6 @@ def main():
 
     inference_config_path = config.inference_config
     infer_config = OmegaConf.load(inference_config_path)
-
 
     ############# model_init started #############
 
@@ -139,25 +165,34 @@ def main():
             unet_additional_kwargs={
                 "use_motion_module": False,
                 "unet_use_temporal_attention": False,
-                "cross_attention_dim": infer_config.unet_additional_kwargs.cross_attention_dim
-            }
+                "cross_attention_dim": infer_config.unet_additional_kwargs.cross_attention_dim,
+            },
         ).to(dtype=weight_dtype, device=device)
     denoising_unet.load_state_dict(
-        torch.load(config.denoising_unet_path, map_location="cpu"),
-        strict=False
+        torch.load(config.denoising_unet_path, map_location="cpu"), strict=False
     )
 
     ## face locator init
-    face_locator = FaceLocator(320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)).to(
-        dtype=weight_dtype, device="cuda"
-    )
+    face_locator = FaceLocator(
+        320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)
+    ).to(dtype=weight_dtype, device="cuda")
     face_locator.load_state_dict(torch.load(config.face_locator_path))
 
     ### load audio processor params
-    audio_processor = load_audio_model(model_path=config.audio_model_path, device=device)
+    audio_processor = load_audio_model(
+        model_path=config.audio_model_path, device=device
+    )
 
     ### load face detector params
-    face_detector = MTCNN(image_size=320, margin=0, min_face_size=20, thresholds=[0.6, 0.7, 0.7], factor=0.709, post_process=True, device=device)
+    face_detector = MTCNN(
+        image_size=320,
+        margin=0,
+        min_face_size=20,
+        thresholds=[0.6, 0.7, 0.7],
+        factor=0.709,
+        post_process=True,
+        device=device,
+    )
 
     ############# model_init finished #############
 
@@ -195,7 +230,7 @@ def main():
 
             #### face musk prepare
             face_img = cv2.imread(ref_image_path)
-            face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype('uint8')
+            face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype("uint8")
 
             det_bboxes, probs = face_detector.detect(face_img)
             select_bbox = select_face(det_bboxes, probs)
@@ -203,7 +238,7 @@ def main():
                 face_mask[:, :] = 255
             else:
                 xyxy = select_bbox[:4]
-                xyxy = np.round(xyxy).astype('int')
+                xyxy = np.round(xyxy).astype("int")
                 rb, re, cb, ce = xyxy[1], xyxy[3], xyxy[0], xyxy[2]
                 r_pad = int((re - rb) * args.facemusk_dilation_ratio)
                 c_pad = int((ce - cb) * args.facemusk_dilation_ratio)
@@ -212,7 +247,12 @@ def main():
                 #### face crop
                 r_pad_crop = int((re - rb) * args.facecrop_dilation_ratio)
                 c_pad_crop = int((ce - cb) * args.facecrop_dilation_ratio)
-                crop_rect = [max(0, cb - c_pad_crop), max(0, rb - r_pad_crop), min(ce + c_pad_crop, face_img.shape[1]), min(re + c_pad_crop, face_img.shape[0])]
+                crop_rect = [
+                    max(0, cb - c_pad_crop),
+                    max(0, rb - r_pad_crop),
+                    min(ce + c_pad_crop, face_img.shape[1]),
+                    min(re + c_pad_crop, face_img.shape[0]),
+                ]
                 print(crop_rect)
                 face_img, _ = crop_and_pad(face_img, crop_rect)
                 face_mask, _ = crop_and_pad(face_mask, crop_rect)
@@ -220,7 +260,14 @@ def main():
                 face_mask = cv2.resize(face_mask, (args.W, args.H))
 
             ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
-            face_mask_tensor = torch.Tensor(face_mask).to(dtype=weight_dtype, device="cuda").unsqueeze(0).unsqueeze(0).unsqueeze(0) / 255.0
+            face_mask_tensor = (
+                torch.Tensor(face_mask)
+                .to(dtype=weight_dtype, device="cuda")
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .unsqueeze(0)
+                / 255.0
+            )
 
             video = pipe(
                 ref_image_pil,
@@ -235,7 +282,7 @@ def main():
                 audio_sample_rate=args.sample_rate,
                 context_frames=args.context_frames,
                 fps=final_fps,
-                context_overlap=args.context_overlap
+                context_overlap=args.context_overlap,
             ).videos
 
             video = video
@@ -246,11 +293,19 @@ def main():
                 fps=final_fps,
             )
 
-            video_clip = VideoFileClip(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}.mp4")
+            video_clip = VideoFileClip(
+                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}.mp4"
+            )
             audio_clip = AudioFileClip(audio_path)
             video_clip = video_clip.set_audio(audio_clip)
-            video_clip.write_videofile(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4", codec="libx264", audio_codec="aac")
-            print(f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4")
+            video_clip.write_videofile(
+                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4",
+                codec="libx264",
+                audio_codec="aac",
+            )
+            print(
+                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4"
+            )
 
 
 if __name__ == "__main__":
