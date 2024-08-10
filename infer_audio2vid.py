@@ -116,40 +116,47 @@ def get_default_args():
 
 
 def main():
-    args = get_default_args()
+    # Default arguments
+    args = {
+        "config": "./configs/prompts/animation.yaml",
+        "W": 512,
+        "H": 512,
+        "L": 1200,
+        "seed": 420,
+        "facemusk_dilation_ratio": 0.1,
+        "facecrop_dilation_ratio": 0.5,
+        "context_frames": 12,
+        "context_overlap": 3,
+        "cfg": 2.5,
+        "steps": 30,
+        "sample_rate": 16000,
+        "fps": 24,
+        "device": "cuda",
+    }
 
-    config = OmegaConf.load(args.config)
-    if config.weight_dtype == "fp16":
-        weight_dtype = torch.float16
-    else:
-        weight_dtype = torch.float32
+    config = OmegaConf.load(args["config"])
+    weight_dtype = torch.float16 if config.weight_dtype == "fp16" else torch.float32
 
-    device = args.device
-    if device.__contains__("cuda") and not torch.cuda.is_available():
+    device = args["device"]
+    if "cuda" in device and not torch.cuda.is_available():
         device = "cpu"
 
-    inference_config_path = config.inference_config
-    infer_config = OmegaConf.load(inference_config_path)
+    infer_config = OmegaConf.load(config.inference_config)
 
-    ############# model_init started #############
+    # Model initialization
+    vae = AutoencoderKL.from_pretrained(config.pretrained_vae_path).to(
+        "cuda", dtype=weight_dtype
+    )
 
-    ## vae init
-    vae = AutoencoderKL.from_pretrained(
-        config.pretrained_vae_path,
-    ).to("cuda", dtype=weight_dtype)
-
-    ## reference net init
     reference_unet = UNet2DConditionModel.from_pretrained(
         config.pretrained_base_model_path,
         subfolder="unet",
     ).to(dtype=weight_dtype, device=device)
     reference_unet.load_state_dict(
-        torch.load(config.reference_unet_path, map_location="cpu"),
+        torch.load(config.reference_unet_path, map_location="cpu")
     )
 
-    ## denoising net init
     if os.path.exists(config.motion_module_path):
-        ### stage1 + stage2
         denoising_unet = EchoUNet3DConditionModel.from_pretrained_2d(
             config.pretrained_base_model_path,
             config.motion_module_path,
@@ -157,7 +164,6 @@ def main():
             unet_additional_kwargs=infer_config.unet_additional_kwargs,
         ).to(dtype=weight_dtype, device=device)
     else:
-        ### only stage1
         denoising_unet = EchoUNet3DConditionModel.from_pretrained_2d(
             config.pretrained_base_model_path,
             "",
@@ -172,18 +178,15 @@ def main():
         torch.load(config.denoising_unet_path, map_location="cpu"), strict=False
     )
 
-    ## face locator init
     face_locator = FaceLocator(
         320, conditioning_channels=1, block_out_channels=(16, 32, 96, 256)
     ).to(dtype=weight_dtype, device="cuda")
     face_locator.load_state_dict(torch.load(config.face_locator_path))
 
-    ### load audio processor params
     audio_processor = load_audio_model(
         model_path=config.audio_model_path, device=device
     )
 
-    ### load face detector params
     face_detector = MTCNN(
         image_size=320,
         margin=0,
@@ -194,12 +197,10 @@ def main():
         device=device,
     )
 
-    ############# model_init finished #############
-
-    width, height = args.W, args.H
-    sched_kwargs = OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
-    scheduler = DDIMScheduler(**sched_kwargs)
-
+    # Pipeline setup
+    scheduler = DDIMScheduler(
+        **OmegaConf.to_container(infer_config.noise_scheduler_kwargs)
+    )
     pipe = Audio2VideoPipeline(
         vae=vae,
         reference_unet=reference_unet,
@@ -207,105 +208,101 @@ def main():
         audio_guider=audio_processor,
         face_locator=face_locator,
         scheduler=scheduler,
-    )
-    pipe = pipe.to("cuda", dtype=weight_dtype)
+    ).to("cuda", dtype=weight_dtype)
 
+    # Output directory setup
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M")
-    save_dir_name = f"{time_str}--seed_{args.seed}-{args.W}x{args.H}"
-    save_dir = Path(f"output/{date_str}/{save_dir_name}")
+    save_dir = Path(
+        f"output/{date_str}/{time_str}--seed_{args['seed']}-{args['W']}x{args['H']}"
+    )
     save_dir.mkdir(exist_ok=True, parents=True)
 
-    for ref_image_path in config["test_cases"].keys():
-        for audio_path in config["test_cases"][ref_image_path]:
-
-            if args.seed is not None and args.seed > -1:
-                generator = torch.manual_seed(args.seed)
-            else:
-                generator = torch.manual_seed(random.randint(100, 1000000))
+    # Process each test case
+    for ref_image_path, audio_paths in config["test_cases"].items():
+        for audio_path in audio_paths:
+            generator = torch.manual_seed(
+                args["seed"] if args["seed"] > -1 else random.randint(100, 1000000)
+            )
 
             ref_name = Path(ref_image_path).stem
             audio_name = Path(audio_path).stem
-            final_fps = args.fps
 
-            #### face musk prepare
+            # Face mask preparation
             face_img = cv2.imread(ref_image_path)
-            face_mask = np.zeros((face_img.shape[0], face_img.shape[1])).astype("uint8")
+            face_mask = np.zeros(face_img.shape[:2], dtype="uint8")
 
             det_bboxes, probs = face_detector.detect(face_img)
             select_bbox = select_face(det_bboxes, probs)
+
             if select_bbox is None:
-                face_mask[:, :] = 255
+                face_mask.fill(255)
             else:
-                xyxy = select_bbox[:4]
-                xyxy = np.round(xyxy).astype("int")
+                xyxy = np.round(select_bbox[:4]).astype(int)
                 rb, re, cb, ce = xyxy[1], xyxy[3], xyxy[0], xyxy[2]
-                r_pad = int((re - rb) * args.facemusk_dilation_ratio)
-                c_pad = int((ce - cb) * args.facemusk_dilation_ratio)
+                r_pad = int((re - rb) * args["facemusk_dilation_ratio"])
+                c_pad = int((ce - cb) * args["facemusk_dilation_ratio"])
                 face_mask[rb - r_pad : re + r_pad, cb - c_pad : ce + c_pad] = 255
 
-                #### face crop
-                r_pad_crop = int((re - rb) * args.facecrop_dilation_ratio)
-                c_pad_crop = int((ce - cb) * args.facecrop_dilation_ratio)
+                # Face crop
+                r_pad_crop = int((re - rb) * args["facecrop_dilation_ratio"])
+                c_pad_crop = int((ce - cb) * args["facecrop_dilation_ratio"])
                 crop_rect = [
                     max(0, cb - c_pad_crop),
                     max(0, rb - r_pad_crop),
                     min(ce + c_pad_crop, face_img.shape[1]),
                     min(re + c_pad_crop, face_img.shape[0]),
                 ]
-                print(crop_rect)
                 face_img, _ = crop_and_pad(face_img, crop_rect)
                 face_mask, _ = crop_and_pad(face_mask, crop_rect)
-                face_img = cv2.resize(face_img, (args.W, args.H))
-                face_mask = cv2.resize(face_mask, (args.W, args.H))
 
-            ref_image_pil = Image.fromarray(face_img[:, :, [2, 1, 0]])
+            face_img = cv2.resize(face_img, (args["W"], args["H"]))
+            face_mask = cv2.resize(face_mask, (args["W"], args["H"]))
+
+            ref_image_pil = Image.fromarray(cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB))
             face_mask_tensor = (
-                torch.Tensor(face_mask)
-                .to(dtype=weight_dtype, device="cuda")
+                torch.tensor(face_mask, dtype=weight_dtype, device="cuda")
                 .unsqueeze(0)
                 .unsqueeze(0)
                 .unsqueeze(0)
                 / 255.0
             )
 
+            # Generate video
             video = pipe(
                 ref_image_pil,
                 audio_path,
                 face_mask_tensor,
-                width,
-                height,
-                args.L,
-                args.steps,
-                args.cfg,
+                args["W"],
+                args["H"],
+                args["L"],
+                args["steps"],
+                args["cfg"],
                 generator=generator,
-                audio_sample_rate=args.sample_rate,
-                context_frames=args.context_frames,
-                fps=final_fps,
-                context_overlap=args.context_overlap,
+                audio_sample_rate=args["sample_rate"],
+                context_frames=args["context_frames"],
+                fps=args["fps"],
+                context_overlap=args["context_overlap"],
             ).videos
 
-            video = video
-            save_videos_grid(
-                video,
-                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}.mp4",
-                n_rows=1,
-                fps=final_fps,
+            # Save video
+            output_path = (
+                save_dir
+                / f"{ref_name}_{audio_name}_{args['H']}x{args['W']}_{int(args['cfg'])}_{time_str}.mp4"
             )
+            save_videos_grid(video, str(output_path), n_rows=1, fps=args["fps"])
 
-            video_clip = VideoFileClip(
-                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}.mp4"
-            )
+            # Add audio to video
+            video_clip = VideoFileClip(str(output_path))
             audio_clip = AudioFileClip(audio_path)
             video_clip = video_clip.set_audio(audio_clip)
+            output_path_with_audio = output_path.with_name(
+                f"{output_path.stem}_withaudio.mp4"
+            )
             video_clip.write_videofile(
-                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4",
-                codec="libx264",
-                audio_codec="aac",
+                str(output_path_with_audio), codec="libx264", audio_codec="aac"
             )
-            print(
-                f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_withaudio.mp4"
-            )
+            print(f"Video saved: {output_path_with_audio}")
 
 
 if __name__ == "__main__":
